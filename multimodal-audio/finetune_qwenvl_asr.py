@@ -1,80 +1,42 @@
+"""Finetune Qwen2-VL 7B for Speech Understanding (ASR).
+
+Training loop:
+  Stage 1: Train audio projector only (optional LR sweep first)
+  Stage 2: Full fine-tune or QLoRA (configurable via YAML)
+
+Usage:
+    python finetune_qwenvl_asr.py --config configs/config1.yml
+"""
+
+import argparse
 import os
 import gc
 import io
-import time
 import json
+import time
 import torch
 import librosa
-import whisper  # needed for pad_or_trim and log_mel_spectrogram
+import whisper
+import yaml
 import wandb
-from dataclasses import dataclass
 from datetime import datetime
 
 from datasets import load_dataset
 from dotenv import load_dotenv
 from huggingface_hub import login, HfApi
-from jiwer import wer
-from peft import LoraConfig, get_peft_model
+from jiwer import wer as compute_wer
 from transformers import (
     Qwen2VLForConditionalGenerationWithAudio,
     Qwen2VLProcessor,
     Trainer,
+    TrainerCallback,
     EarlyStoppingCallback,
 )
 from trl import SFTConfig, SFTTrainer
 
 
-@dataclass
-class Config:
-    # Stage 1: audio projector-only (0.2% params trainable)
-    stg1_steps: int = 22500
-    stg1_lr: float = 5e-4
-    stg1_batch: int = 2
-    stg1_grad_accum: int = 2  
-    stg1_warmup: float = 0.1
-
-    # Stage 2: QLoRA on the entire model
-    stg2_steps: int = 1000
-    stg2_lr: float = 2e-5
-    stg2_batch: int = 2
-    stg2_grad_accum: int = 4  
-    stg2_warmup: float = 0.1
-    stg2_early_stopping_patience: int = 5
-
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
-    lora_target_modules: tuple = ("q_proj", "v_proj", "k_proj")
-
-    lr_schedule: str = "cosine"
-    exp_name: str = ""
-
-
-cfg = Config()
-
-RUN_TAG = datetime.now().strftime("%m%d%H%M")
-if cfg.exp_name:
-    RUN_TAG = f"{RUN_TAG}_{cfg.exp_name}"
-
-load_dotenv(os.path.expanduser("~/ft/.env"))
-
-HF_TOKEN = os.environ["HF_TOKEN"]
-login(token=HF_TOKEN)
-
-HF_repo_base = "hyan/qwen_speech_base"
-HF_repo_stg1 = "hyan/qwen_speech_stage1"
-HF_repo_ft   = "hyan/qwen-speech-ft"
-
-api = HfApi()
-api.create_repo(HF_repo_stg1, exist_ok=True)
-api.create_repo(HF_repo_ft, exist_ok=True)
-
-print(f"Run tag: {RUN_TAG}")
-print(f"Config: {cfg}")
-
-
-
-WHISPER_N_MELS = 128  
+WHISPER_N_MELS = 128
+SAMPLE_RATE = 16000
 
 
 def bytes2mel(audio_np):
@@ -84,28 +46,29 @@ def bytes2mel(audio_np):
 
 
 def bytes_to_waveform(audio_bytes):
-    audio_buffer = io.BytesIO(audio_bytes)
-    y, sr = librosa.load(audio_buffer, sr=16000)
-    return y
+    return librosa.load(io.BytesIO(audio_bytes), sr=SAMPLE_RATE)[0]
+
+
+def chunk_waveform(audio_np, chunk_sec):
+    if chunk_sec <= 0 or len(audio_np) <= chunk_sec * SAMPLE_RATE:
+        return [audio_np]
+    chunk_len = chunk_sec * SAMPLE_RATE
+    chunks = []
+    for start in range(0, len(audio_np), chunk_len):
+        chunks.append(audio_np[start:start + chunk_len])
+    return chunks
 
 
 def format_data(record):
-    conversation = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "audio", "audio": record["wav"]["bytes"]},
-                {"type": "text", "text": "Transcribe this audio."},
-            ],
-        },
-        {
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": record["text"]},
-            ],
-        },
-    ]
-    return {"messages": conversation}
+    return {"messages": [
+        {"role": "user", "content": [
+            {"type": "audio", "audio": record["wav"]["bytes"]},
+            {"type": "text", "text": "Transcribe this audio."},
+        ]},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": record["text"]},
+        ]},
+    ]}
 
 
 def extract_audio_bytes(msgs):
@@ -116,7 +79,7 @@ def extract_audio_bytes(msgs):
     return None
 
 
-AUDIO_TEMPLATE_ORIG = (
+TMPL_ORIG = (
     "{% else %}{% for content in message['content'] %}"
     "{% if content['type'] == 'image' or 'image' in content or 'image_url' in content %}"
     "{% set image_count.value = image_count.value + 1 %}"
@@ -130,7 +93,7 @@ AUDIO_TEMPLATE_ORIG = (
     "{% endif %}{% endfor %}<|im_end|>"
 )
 
-AUDIO_TEMPLATE_REPLACEMENT = (
+TMPL_REPL = (
     "{% else %}{% for content in message['content'] %}"
     "{% if content['type'] == 'audio' or 'audio' in content or 'audio_url' in content %}"
     "<|audio_start|><|audio_pad|><|audio_end|>"
@@ -152,310 +115,473 @@ def patch_processor(proc):
     proc.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
     tmpl = proc.tokenizer.chat_template
     if "audio" not in tmpl:
-        tmpl = tmpl.replace(AUDIO_TEMPLATE_ORIG, AUDIO_TEMPLATE_REPLACEMENT, 1)
+        tmpl = tmpl.replace(TMPL_ORIG, TMPL_REPL, 1)
         proc.tokenizer.chat_template = tmpl
     proc.chat_template = proc.tokenizer.chat_template
     assert "audio" in proc.chat_template, "Chat template patch failed!"
     return proc
 
+def make_collate_fn(processor):
+    def collate_fn(examples):
+        texts, mel_list, raw_lens = [], [], []
+        for ex in examples:
+            fmt = format_data(ex)
+            msgs = fmt["messages"]
+            full_text = processor.apply_chat_template(msgs, tokenize=False)
+            prompt_text = processor.apply_chat_template(
+                [msgs[0]], tokenize=False, add_generation_prompt=True)
+            raw_len = processor.tokenizer(
+                prompt_text, return_tensors="pt")["input_ids"].shape[1]
+            audio_bytes = extract_audio_bytes(msgs)
+            if audio_bytes is None:
+                continue
+            wav = bytes_to_waveform(audio_bytes)
+            mel = bytes2mel(wav).squeeze(0).cpu()
+            texts.append(full_text)
+            mel_list.append(mel)
+            raw_lens.append(raw_len)
+        if not texts:
+            return None
+        batch = processor(
+            text=texts, audio=mel_list, padding=True, return_tensors="pt")
+        labels = batch["input_ids"].clone()
+        labels[labels == processor.tokenizer.pad_token_id] = -100
+        for tid in [151657, 151658, 151659]:
+            labels[labels == tid] = -100
+        audio_pad_id = processor.tokenizer.convert_tokens_to_ids("<|audio_pad|>")
+        for i, rl in enumerate(raw_lens):
+            n_audio = (batch["input_ids"][i] == audio_pad_id).sum().item()
+            pl = rl + max(0, n_audio - 1)
+            labels[i, :pl] = -100
+        batch["labels"] = labels
+        return batch
 
-processor = Qwen2VLProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
-processor = patch_processor(processor)
-processor.save_pretrained("./qwen2-vl-speech-processor")
+    return collate_fn
 
 
-def prepare_audio_encoder(model):
-    """Upcast whisper encoder to fp32 and freeze it.
-    """
-    model.audio_encoder.float()
-    for p in model.audio_encoder.parameters():
-        p.requires_grad = False
-    model.audio_encoder.eval()
-    device = next(model.audio_encoder.parameters()).device
+def transcribe_single(model, processor, mel):
+    user_msgs = [{"role": "user", "content": [
+        {"type": "audio", "audio": b"placeholder"},
+        {"type": "text", "text": "Transcribe this audio."},
+    ]}]
+    text = processor.apply_chat_template(
+        user_msgs, tokenize=False, add_generation_prompt=True)
+    batch = processor(
+        text=[text], audio=[mel], padding=True, return_tensors="pt")
+    batch = {k: v.to(model.device) if hasattr(v, "to") else v
+             for k, v in batch.items()}
     with torch.no_grad():
-        dummy = torch.randn(1, WHISPER_N_MELS, 3000, device=device)
-        test_out = model.audio_encoder(dummy)
-        assert not torch.isnan(test_out).any(), "Whisper encoder produces NaN — fp32 upcast insufficient, may need fresh weights"
-    return model
+        gen = model.generate(**batch, max_new_tokens=256, do_sample=False)
+    return processor.tokenizer.decode(
+        gen[0][batch["input_ids"].shape[1]:],
+        skip_special_tokens=True).strip()
 
 
-def collate_fn(examples):
-    texts = []
-    mel_list = []
-    raw_prompt_lens = []
-
-    for ex in examples:
-        formatted = format_data(ex)
-        msgs = formatted["messages"]
-        full_text = processor.apply_chat_template(msgs, tokenize=False)
-
-        prompt_msgs = [msgs[0]]
-        prompt_text = processor.apply_chat_template(
-            prompt_msgs, tokenize=False, add_generation_prompt=True
-        )
-        raw_prompt_ids = processor.tokenizer(prompt_text, return_tensors="pt")["input_ids"]
-        raw_prompt_len = raw_prompt_ids.shape[1]
-
-        audio_bytes = extract_audio_bytes(msgs)
-        if audio_bytes is None:
-            continue
-        wav = bytes_to_waveform(audio_bytes)
-        mel = bytes2mel(wav).squeeze(0).cpu()
-        texts.append(full_text)
-        mel_list.append(mel)
-        raw_prompt_lens.append(raw_prompt_len)
-
-    if len(texts) == 0:
-        return None
-
-    batch = processor(text=texts, audio=mel_list, padding=True, return_tensors="pt")
-    labels = batch["input_ids"].clone()
-    labels[labels == processor.tokenizer.pad_token_id] = -100
-    for audio_token_id in [151657, 151658, 151659]:
-        labels[labels == audio_token_id] = -100
-    AUDIO_PAD_ID = 151658
-    for i, raw_prompt_len in enumerate(raw_prompt_lens):
-        audio_pad_count = (batch["input_ids"][i] == AUDIO_PAD_ID).sum().item()
-        if audio_pad_count > 0:
-            expanded_prompt_len = raw_prompt_len + audio_pad_count - 1
-        else:
-            expanded_prompt_len = raw_prompt_len
-        labels[i, :expanded_prompt_len] = -100
-
-    batch["labels"] = labels
-    return batch
-
-
-def evaluate_wer(model, processor, eval_samples, split_name="eval"):
+def evaluate_wer(model, processor, eval_samples, split_name="eval",
+                 chunk_sec=0):
     model.eval()
-    references = []
-    hypotheses = []
-
+    refs, hyps = [], []
     for i, sample in enumerate(eval_samples):
-        ref_text = sample["text"].strip().lower()
-        references.append(ref_text)
-
-        user_msgs = [
-            {"role": "user", "content": [
-                {"type": "audio", "audio": sample["wav"]["bytes"]},
-                {"type": "text", "text": "Transcribe this audio."},
-            ]},
-        ]
-        text = processor.apply_chat_template(user_msgs, tokenize=False, add_generation_prompt=True)
+        ref = sample["text"].strip().lower()
+        refs.append(ref)
         wav = bytes_to_waveform(sample["wav"]["bytes"])
-        mel = bytes2mel(wav).squeeze(0).cpu()
-
-        batch = processor(text=[text], audio=[mel], padding=True, return_tensors="pt")
-        batch = {k: v.to(model.device) if hasattr(v, 'to') else v for k, v in batch.items()}
-
-        with torch.no_grad():
-            generated_ids = model.generate(**batch, max_new_tokens=256, do_sample=False)
-
-        input_len = batch["input_ids"].shape[1]
-        output_ids = generated_ids[0][input_len:]
-        hyp_text = processor.tokenizer.decode(output_ids, skip_special_tokens=True).strip().lower()
-        hypotheses.append(hyp_text)
-
-        print(f"  [{split_name} {i+1}] REF: {ref_text[:100]}")
-        print(f"  [{split_name} {i+1}] HYP: {hyp_text[:100]}")
-
-    error_rate = wer(references, hypotheses)
-    print(f"\n  {split_name} WER: {error_rate:.4f} ({error_rate*100:.1f}%)")
+        chunks = chunk_waveform(wav, chunk_sec)
+        parts = []
+        for chunk in chunks:
+            mel = bytes2mel(chunk).squeeze(0).cpu()
+            parts.append(transcribe_single(model, processor, mel))
+        hyp = " ".join(parts).lower()
+        hyps.append(hyp)
+    err = compute_wer(refs, hyps)
+    print(f"  {split_name} WER: {err:.4f} ({err*100:.1f}%) on {len(eval_samples)} samples")
     model.train()
-    return error_rate
+    return err
 
 
+class WERCallback(TrainerCallback):
+    def __init__(self, model, processor, eval_samples, eval_steps, patience,
+                 run_tag=""):
+        self.model = model
+        self.processor = processor
+        self.eval_samples = eval_samples
+        self.eval_steps = eval_steps
+        self.patience = patience
+        self.run_tag = run_tag
+        self.best_wer = float("inf")
+        self.best_step = 0
+        self.wait = 0
 
-train_dataset = load_dataset(
-    "speechbrain/LargeScaleASR",
-    data_files=["small/train-0000*", "small/train-0001*"],
-    num_proc=12,
-)
-test_dataset = load_dataset(
-    "speechbrain/LargeScaleASR",
-    data_files=["test/test-00000*"],
-    num_proc=12,
-)
-train_dataset = train_dataset["train"]
-test_dataset = test_dataset["train"]
-test_dataset = test_dataset.select(range(100))
-print(f"  Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+    def on_step_end(self, args, state, control, **kwargs):
+        step = state.global_step
+        if step % self.eval_steps != 0 or step == 0:
+            return
+        wer = evaluate_wer(self.model, self.processor, self.eval_samples,
+                           f"step_{step}")
+        wandb.log({"wer_val": wer, "step": step})
 
-eval_train_samples = [train_dataset[i] for i in range(10)]
-eval_val_samples = [test_dataset[i] for i in range(10)]
+        if wer < self.best_wer:
+            self.best_wer, self.best_step, self.wait = wer, step, 0
+            save_dir = f"./models/stg2_best_{self.run_tag}"
+            os.makedirs(save_dir, exist_ok=True)
+            self.model.save_pretrained(save_dir)
+            self.processor.save_pretrained(save_dir)
+        else:
+            self.wait += 1
+
+        if self.wait >= self.patience:
+            print(f"Early stopping at step {step}: best WER={self.best_wer:.4f}")
+            control.should_training_stop = True
 
 
 def clear_memory():
-    time.sleep(2)
+    time.sleep(1)
     gc.collect()
-    time.sleep(2)
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-    time.sleep(2)
     gc.collect()
-    time.sleep(2)
 
 
-# ==============================================================
-# STAGE 1: Train only audio projector (freeze LM + whisper)
-# ==============================================================
+def run_sweep(cfg, hf_base, wandb_project, run_tag, processor,
+              train_dataset, test_dataset, collate):
+    sweep_cfg = cfg["sweep"]
+    sweep_steps = sweep_cfg["steps"]
+    sweep_configs = sweep_cfg["configs"]
+    stg1_batch = cfg["stg1"]["batch_size"]
 
-model = Qwen2VLForConditionalGenerationWithAudio.from_pretrained(
-    HF_repo_base, torch_dtype=torch.bfloat16, device_map="auto"
-)
-model = prepare_audio_encoder(model)
+    sweep_results = []
 
-processor = patch_processor(Qwen2VLProcessor.from_pretrained("./qwen2-vl-speech-processor"))
+    for ci, scfg in enumerate(sweep_configs):
+        model = Qwen2VLForConditionalGenerationWithAudio.from_pretrained(
+            hf_base, torch_dtype=torch.bfloat16, device_map="auto")
+        proc = patch_processor(
+            Qwen2VLProcessor.from_pretrained("./qwen2-vl-speech-processor"))
+        model.reload_audio_encoder()
+        for n, p in model.named_parameters():
+            p.requires_grad = "audio_projector" in n
 
-for name, param in model.named_parameters():
-    if "audio_projector" in name:
-        param.requires_grad = True
+        wandb.init(project=wandb_project,
+                   name=f"sweep_{scfg['name']}_{run_tag}",
+                   group=f"sweep_{run_tag}", config=scfg, reinit=True)
+
+        trainer = SFTTrainer(
+            model=model,
+            args=SFTConfig(
+                output_dir=f"./sweep_{scfg['name']}_{run_tag}",
+                max_steps=sweep_steps,
+                per_device_train_batch_size=stg1_batch,
+                per_device_eval_batch_size=2,
+                gradient_accumulation_steps=scfg["grad_accum"],
+                learning_rate=scfg["lr"], warmup_ratio=scfg["warmup"],
+                logging_steps=10, eval_strategy="steps", eval_steps=50,
+                bf16=True, report_to="wandb",
+                dataset_kwargs={"skip_prepare_dataset": True},
+                remove_unused_columns=False),
+            train_dataset=train_dataset, eval_dataset=test_dataset,
+            data_collator=collate, processing_class=proc)
+
+        trainer.train()
+        log = trainer.state.log_history
+        train_losses = [e["loss"] for e in log if "loss" in e]
+        eval_losses = [e["eval_loss"] for e in log if "eval_loss" in e]
+        final_train = train_losses[-1] if train_losses else float("inf")
+        final_eval = eval_losses[-1] if eval_losses else float("inf")
+        sweep_results.append({**scfg, "train_loss": final_train, "eval_loss": final_eval})
+        wandb.log({"final_train_loss": final_train, "final_eval_loss": final_eval})
+        wandb.finish()
+        print(f"    => train={final_train:.4f}, eval={final_eval:.4f}")
+        del model, trainer
+        clear_memory()
+
+    best = min(sweep_results, key=lambda x: x["eval_loss"])
+    print(f"\nBEST: {best['name']} (eval={best['eval_loss']:.4f})")
+    return best["lr"], best["grad_accum"], best["warmup"]
+
+
+def train_stage1(cfg, best_lr, best_ga, best_warmup, hf_base, hf_stg1,
+                 wandb_project, run_tag, processor,
+                 train_dataset, test_dataset, collate,
+                 eval_train_samples, eval_val_samples):
+    stg1 = cfg["stg1"]
+
+    model = Qwen2VLForConditionalGenerationWithAudio.from_pretrained(
+        hf_base, torch_dtype=torch.bfloat16, device_map="auto")
+    proc = patch_processor(
+        Qwen2VLProcessor.from_pretrained("./qwen2-vl-speech-processor"))
+    model.reload_audio_encoder()
+
+    for n, p in model.named_parameters():
+        p.requires_grad = "audio_projector" in n
+
+    wandb.init(project=wandb_project, name=f"stg1_{run_tag}",
+               group=f"stg1_{run_tag}",
+               config={"lr": best_lr, "grad_accum": best_ga,
+                       "warmup": best_warmup, "steps": stg1["steps"]})
+
+    trainer = SFTTrainer(
+        model=model,
+        args=SFTConfig(
+            output_dir=f"./stg1_{run_tag}", max_steps=stg1["steps"],
+            per_device_train_batch_size=stg1["batch_size"],
+            per_device_eval_batch_size=2,
+            gradient_accumulation_steps=best_ga,
+            learning_rate=best_lr, warmup_ratio=best_warmup,
+            logging_steps=10, eval_strategy="steps", eval_steps=100,
+            save_strategy="steps", save_steps=500,
+            bf16=True, report_to="wandb",
+            dataset_kwargs={"skip_prepare_dataset": True},
+            remove_unused_columns=False),
+        train_dataset=train_dataset, eval_dataset=test_dataset,
+        data_collator=collate, processing_class=proc)
+
+    trainer.train()
+
+    wer_t = evaluate_wer(model, proc, eval_train_samples, "stg1_train")
+    wer_v = evaluate_wer(model, proc, eval_val_samples[:10], "stg1_val")
+    wandb.log({"stg1_wer_train": wer_t, "stg1_wer_val": wer_v})
+
+    stg1_local = f"./models/stg1_{run_tag}"
+    os.makedirs(stg1_local, exist_ok=True)
+    model.save_pretrained(stg1_local)
+    proc.save_pretrained(stg1_local)
+    model.push_to_hub(hf_stg1)
+    proc.push_to_hub(hf_stg1)
+    wandb.finish()
+
+    del model, trainer
+    clear_memory()
+    return stg1_local, wer_t, wer_v
+
+
+def train_stage2(cfg, stg1_local, hf_ft, wandb_project, run_tag,
+                 train_dataset, test_dataset, collate,
+                 eval_train_samples, eval_val_samples):
+    stg2 = cfg["stg2"]
+    use_qlora = cfg.get("qlora", True)
+
+    if use_qlora:
+        from transformers import BitsAndBytesConfig
+        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+        quant_cfg = cfg.get("quantization", {})
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=quant_cfg.get("load_in_4bit", True),
+            bnb_4bit_quant_type=quant_cfg.get("bnb_4bit_quant_type", "nf4"),
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=quant_cfg.get(
+                "bnb_4bit_use_double_quant", True),
+            llm_int8_skip_modules=["audio_encoder", "audio_projector"],
+        )
+        model = Qwen2VLForConditionalGenerationWithAudio.from_pretrained(
+            stg1_local, quantization_config=bnb_config, device_map="auto")
     else:
-        param.requires_grad = False
+        model = Qwen2VLForConditionalGenerationWithAudio.from_pretrained(
+            stg1_local, torch_dtype=torch.bfloat16).to("cuda")
 
-trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-total = sum(p.numel() for p in model.parameters())
-print(f"  Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+    processor = patch_processor(
+        Qwen2VLProcessor.from_pretrained(stg1_local))
+    model.reload_audio_encoder()
 
-wandb.login(key=os.environ["wandb"])
-wandb.init(project="qwen2vl_speech", name=f"speech_stg1_{RUN_TAG}")
+    if use_qlora:
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=True)
 
-sft_config_stg1 = SFTConfig(
-    output_dir=f"./speech_stg1_{RUN_TAG}",
-    max_steps=cfg.stg1_steps,
-    per_device_train_batch_size=cfg.stg1_batch,
-    per_device_eval_batch_size=2,
-    gradient_accumulation_steps=cfg.stg1_grad_accum,
-    learning_rate=cfg.stg1_lr,
-    warmup_ratio=cfg.stg1_warmup,
-    logging_steps=10,
-    eval_strategy="steps",
-    eval_steps=100,
-    bf16=True,
-    report_to="wandb",
-    dataset_kwargs={"skip_prepare_dataset": True},
-    remove_unused_columns=False,
-)
+        lora_cfg = cfg.get("lora", {})
+        lora_config = LoraConfig(
+            r=lora_cfg.get("r", 16),
+            lora_alpha=lora_cfg.get("alpha", 32),
+            lora_dropout=lora_cfg.get("dropout", 0.05),
+            target_modules=lora_cfg.get("target_modules",
+                                        ["q_proj", "v_proj", "k_proj"]),
+            bias="none",
+            task_type="CAUSAL_LM")
+        model = get_peft_model(model, lora_config)
 
-trainer_stage1 = SFTTrainer(
-    model=model,
-    args=sft_config_stg1,
-    train_dataset=train_dataset,
-    eval_dataset=test_dataset,
-    data_collator=collate_fn,
-    processing_class=processor,
-)
+        for n, p in model.named_parameters():
+            if "audio_projector" in n:
+                p.requires_grad = True
 
-print(f"  Stage 1: {cfg.stg1_steps} steps, LR={cfg.stg1_lr}, eff_batch={cfg.stg1_batch * cfg.stg1_grad_accum}")
-trainer_stage1.train()
-print("  Stage 1 training complete!")
+        model.print_trainable_parameters()
+        optim = "paged_adamw_8bit"
+    else:
+        for n, p in model.named_parameters():
+            p.requires_grad = True
+        optim = "adamw_torch"
 
-wer_train_stg1 = evaluate_wer(model, processor, eval_train_samples, "stg1_train")
-wer_val_stg1 = evaluate_wer(model, processor, eval_val_samples, "stg1_val")
-wandb.log({"stg1_wer_train": wer_train_stg1, "stg1_wer_val": wer_val_stg1})
+    wandb.init(project=wandb_project, name=f"stg2_{run_tag}",
+               group=f"stg2_{run_tag}",
+               config={"lr": stg2["lr"], "qlora": use_qlora,
+                       "steps": stg2["steps"]})
 
-os.makedirs("./models", exist_ok=True)
-stg1_local = f"./models/stg1_{RUN_TAG}"
-model.save_pretrained(stg1_local)
-processor.save_pretrained(stg1_local)
-model.push_to_hub(HF_repo_stg1)
-processor.push_to_hub(HF_repo_stg1)
-print(f"  Stage 1 saved to {stg1_local}")
-wandb.finish()
+    callbacks = []
+    wer_callback = None
+    if use_qlora:
+        wer_eval_steps = stg2.get("wer_eval_steps", 50)
+        wer_eval_n = stg2.get("wer_eval_samples", 50)
+        wer_callback = WERCallback(
+            model=model, processor=processor,
+            eval_samples=eval_val_samples[:wer_eval_n],
+            eval_steps=wer_eval_steps,
+            patience=stg2["early_stopping_patience"],
+            run_tag=run_tag)
+        callbacks.append(wer_callback)
+        eval_steps = wer_eval_steps
+        save_steps = wer_eval_steps
+        load_best = False
+    else:
+        early_threshold = stg2.get("early_stopping_threshold", 0.0)
+        callbacks.append(EarlyStoppingCallback(
+            early_stopping_patience=stg2["early_stopping_patience"],
+            early_stopping_threshold=early_threshold))
+        eval_steps = 50
+        save_steps = 50
+        load_best = True
 
-del model, trainer_stage1
-clear_memory()
+    # QLoRA dequantizes LM embeddings to fp32, but bf16 autocast makes
+    # audio_projector output bf16 -- masked_scatter needs matching dtypes.
+    if use_qlora:
+        def _cast_projector_output(module, input, output):
+            return output.float()
+        model.audio_projector.register_forward_hook(_cast_projector_output)
 
-# ==============================================================
-# STAGE 2: LoRA fine-tuning of LM (whisper stays frozen)
-# ==============================================================
+    trainer = Trainer(
+        model=model,
+        args=SFTConfig(
+            output_dir=f"./stg2_{run_tag}",
+            max_steps=stg2["steps"],
+            per_device_train_batch_size=stg2["batch_size"],
+            per_device_eval_batch_size=2,
+            gradient_accumulation_steps=stg2["grad_accum"],
+            gradient_checkpointing=True,
+            optim=optim,
+            logging_steps=10,
+            eval_strategy="steps",
+            eval_steps=eval_steps,
+            save_strategy="steps",
+            save_steps=save_steps,
+            load_best_model_at_end=load_best,
+            metric_for_best_model="eval_loss" if load_best else None,
+            greater_is_better=False if load_best else None,
+            learning_rate=stg2["lr"],
+            bf16=True,
+            max_grad_norm=1.0,
+            warmup_ratio=stg2["warmup"],
+            lr_scheduler_type=cfg.get("lr_schedule", "cosine"),
+            report_to="wandb",
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+            dataset_text_field="",
+            dataset_kwargs={"skip_prepare_dataset": True},
+            remove_unused_columns=False),
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
+        data_collator=collate,
+        callbacks=callbacks)
 
-model2 = Qwen2VLForConditionalGenerationWithAudio.from_pretrained(
-    stg1_local, torch_dtype=torch.bfloat16, device_map="auto"
-)
-model2 = prepare_audio_encoder(model2)
+    trainer.train()
 
-processor = patch_processor(Qwen2VLProcessor.from_pretrained(stg1_local))
+    if use_qlora:
+        eval_model = model.merge_and_unload()
+    else:
+        eval_model = model
 
-lora_config = LoraConfig(
-    r=cfg.lora_r,
-    lora_alpha=cfg.lora_alpha,
-    lora_dropout=cfg.lora_dropout,
-    target_modules=list(cfg.lora_target_modules),
-    bias="none",
-    task_type="CAUSAL_LM",
-)
-model2 = get_peft_model(model2, lora_config)
-model2.print_trainable_parameters()
+    wer_t = evaluate_wer(eval_model, processor, eval_train_samples, "stg2_train")
+    wer_v = evaluate_wer(eval_model, processor, eval_val_samples[:10], "stg2_val")
+    wandb.log({"stg2_wer_train": wer_t, "stg2_wer_val": wer_v})
 
-wandb.init(project="qwen2vl_speech", name=f"speech_stg2_{RUN_TAG}")
+    stg2_local = f"./models/stg2_{run_tag}"
+    os.makedirs(stg2_local, exist_ok=True)
+    eval_model.save_pretrained(stg2_local)
+    processor.save_pretrained(stg2_local)
+    eval_model.push_to_hub(hf_ft)
+    processor.push_to_hub(hf_ft)
+    wandb.finish()
 
-training_args = SFTConfig(
-    output_dir=f"./speech_stg2_{RUN_TAG}",
-    max_steps=cfg.stg2_steps,
-    per_device_train_batch_size=cfg.stg2_batch,
-    gradient_accumulation_steps=cfg.stg2_grad_accum,
-    gradient_checkpointing=True,
-    optim="adamw_torch",
-    logging_steps=10,
-    eval_strategy="steps",
-    eval_steps=100,
-    per_device_eval_batch_size=2,
-    save_strategy="steps",
-    save_steps=250,
-    learning_rate=cfg.stg2_lr,
-    bf16=True,
-    max_grad_norm=1.0,
-    warmup_ratio=cfg.stg2_warmup,
-    lr_scheduler_type=cfg.lr_schedule,
-    report_to="wandb",
-    gradient_checkpointing_kwargs={"use_reentrant": False},
-    dataset_kwargs={"skip_prepare_dataset": True},
-    load_best_model_at_end=True,
-    metric_for_best_model="eval_loss",
-    greater_is_better=False,
-    remove_unused_columns=False,
-)
-
-trainer = Trainer(
-    model=model2,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=test_dataset,
-    data_collator=collate_fn,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=cfg.stg2_early_stopping_patience)],
-)
-
-print(f"  Stage 2: {cfg.stg2_steps} steps, LR={cfg.stg2_lr}, LoRA r={cfg.lora_r}, early_stop={cfg.stg2_early_stopping_patience}")
-trainer.train()
-print("  Stage 2 training complete!")
-
-wer_train_stg2 = evaluate_wer(model2, processor, eval_train_samples, "stg2_train")
-wer_val_stg2 = evaluate_wer(model2, processor, eval_val_samples, "stg2_val")
-wandb.log({"stg2_wer_train": wer_train_stg2, "stg2_wer_val": wer_val_stg2})
-
-merged_model = model2.merge_and_unload()
-
-stg2_local = f"./models/stg2_{RUN_TAG}"
-merged_model.save_pretrained(stg2_local)
-processor.save_pretrained(stg2_local)
-merged_model.push_to_hub(HF_repo_ft)
-processor.push_to_hub(HF_repo_ft)
-print(f"  Stage 2 saved to {stg2_local}")
-wandb.finish()
+    extra = {}
+    if wer_callback:
+        extra["stg2_best_wer"] = wer_callback.best_wer
+        extra["stg2_best_step"] = wer_callback.best_step
+    return wer_t, wer_v, extra
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Finetune Qwen2-VL for ASR")
+    parser.add_argument("--config", required=True, help="Path to YAML config")
+    args = parser.parse_args()
 
-results = {
-    "run_tag": RUN_TAG,
-    "exp_name": cfg.exp_name,
-    "stg1_steps": cfg.stg1_steps, "stg1_lr": cfg.stg1_lr,
-    "stg2_steps": cfg.stg2_steps, "stg2_lr": cfg.stg2_lr,
-    "lora_r": cfg.lora_r, "lora_alpha": cfg.lora_alpha,
-    "stg1_wer_train": wer_train_stg1, "stg1_wer_val": wer_val_stg1,
-    "stg2_wer_train": wer_train_stg2, "stg2_wer_val": wer_val_stg2,
-}
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
 
-with open(f"results_{RUN_TAG}.json", "w") as f:
-    json.dump(results, f, indent=2)
-print(f"RESULTS_JSON {json.dumps(results)}")
+    run_tag = datetime.now().strftime("%m%d%H%M")
+    exp_name = cfg.get("exp_name", "")
+    if exp_name:
+        run_tag = f"{run_tag}_{exp_name}"
+
+    load_dotenv(os.path.expanduser("~/ft/.env"))
+    login(token=os.environ["HF_TOKEN"])
+
+    hf_base = cfg["hf_repo_base"]
+    hf_stg1 = cfg["hf_repo_stg1"]
+    hf_ft = cfg["hf_repo_ft"]
+
+    api = HfApi()
+    api.create_repo(hf_stg1, exist_ok=True)
+    api.create_repo(hf_ft, exist_ok=True)
+
+    wandb_project = cfg.get("wandb_project", "qwen2vl_speech")
+    wandb.login(key=os.environ["wandb"])
+
+    processor = patch_processor(
+        Qwen2VLProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct"))
+    processor.save_pretrained("./qwen2-vl-speech-processor")
+
+    train_dataset = load_dataset(
+        "speechbrain/LargeScaleASR",
+        data_files=["small/train-0000*", "small/train-0001*"],
+        num_proc=12)["train"]
+    test_dataset = load_dataset(
+        "speechbrain/LargeScaleASR",
+        data_files=["test/test-00000*"],
+        num_proc=12)["train"].select(range(200))
+
+    eval_train_samples = [train_dataset[i] for i in range(10)]
+    eval_val_samples = [test_dataset[i] for i in range(
+        cfg["stg2"].get("wer_eval_samples", 50))]
+
+    collate = make_collate_fn(processor)
+
+    stg1 = cfg["stg1"]
+    best_lr, best_ga, best_warmup = stg1["lr"], stg1["grad_accum"], stg1["warmup"]
+
+    sweep_cfg = cfg.get("sweep")
+    if sweep_cfg and sweep_cfg.get("configs"):
+        best_lr, best_ga, best_warmup = run_sweep(
+            cfg, hf_base, wandb_project, run_tag, processor,
+            train_dataset, test_dataset, collate)
+
+    stg1_local, wer_t1, wer_v1 = train_stage1(
+        cfg, best_lr, best_ga, best_warmup,
+        hf_base, hf_stg1, wandb_project, run_tag, processor,
+        train_dataset, test_dataset, collate,
+        eval_train_samples, eval_val_samples)
+    print(f"Stage 1: train WER={wer_t1:.3f}, val WER={wer_v1:.3f}")
+
+    wer_t2, wer_v2, extra = train_stage2(
+        cfg, stg1_local, hf_ft, wandb_project, run_tag,
+        train_dataset, test_dataset, collate,
+        eval_train_samples, eval_val_samples)
+    print(f"Stage 2: train WER={wer_t2:.3f}, val WER={wer_v2:.3f}")
+
+
+    results = {
+        "run_tag": run_tag, "exp_name": exp_name,
+        "qlora": cfg.get("qlora", True),
+        "stg1_wer_train": wer_t1, "stg1_wer_val": wer_v1,
+        "stg2_wer_train": wer_t2, "stg2_wer_val": wer_v2,
+        **extra,
+    }
+    with open(f"results_{run_tag}.json", "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"RESULTS_JSON {json.dumps(results)}")
+
+
+if __name__ == "__main__":
+    main()

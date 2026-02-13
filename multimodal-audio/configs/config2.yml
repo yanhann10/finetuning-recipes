@@ -1,4 +1,4 @@
-exp_name: "qlora_4bit"
+exp_name: "long_loop"
 
 stg1:
   steps: 22500

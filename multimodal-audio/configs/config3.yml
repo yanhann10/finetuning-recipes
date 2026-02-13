@@ -1,0 +1,60 @@
+exp_name: "short_loop"
+
+stg1:
+  steps: 2200
+  lr: 3.0e-4
+  batch_size: 2
+  grad_accum: 2
+  warmup: 0.20
+
+sweep:
+  steps: 200
+  configs:
+    - lr: 5.0e-5
+      grad_accum: 4
+      warmup: 0.10
+      name: "lr5e-5_ga4"
+    - lr: 1.0e-4
+      grad_accum: 4
+      warmup: 0.10
+      name: "lr1e-4_ga4"
+    - lr: 2.0e-4
+      grad_accum: 2
+      warmup: 0.15
+      name: "lr2e-4_ga2"
+    - lr: 3.0e-4
+      grad_accum: 2
+      warmup: 0.20
+      name: "lr3e-4_ga2"
+
+stg2:
+  steps: 500
+  lr: 2.0e-6
+  batch_size: 2
+  grad_accum: 4
+  warmup: 0.05
+  early_stopping_patience: 5
+  early_stopping_threshold: 0.0
+  wer_eval_steps: 50
+  wer_eval_samples: 50
+
+qlora: true
+
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "down_proj"]
+
+quantization:
+  load_in_4bit: true
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_use_double_quant: true
+
+lr_schedule: "cosine"
+
+hf_repo_base: "hyan/qwen_speech_base"
+hf_repo_stg1: "hyan/qwen_speech_stage1_cfg3"
+hf_repo_ft: "hyan/qwen-speech-ft_cfg3"
+
+wandb_project: "qwen2vl_speech_cfg3"
