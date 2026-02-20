@@ -1,0 +1,20 @@
+exp_name: "audio_vqa"
+base_model: "hyan/qwen_speech_base"
+dataset_repo: "hyan/audio-vqa-aokvqa"
+hf_repo_stg1: "hyan/qwen_audio_vqa_stage1"
+hf_repo_ft: "hyan/qwen-audio-vqa-ft"
+wandb_project: "qwen2vl_audio_vqa"
+eval_n: 100
+stg1:
+  steps: 500
+  lr: 1e-3
+  batch_size: 1
+  grad_accum: 64
+  warmup: 0.1
+stg2:
+  steps: 2000
+  lr: 2e-5
+  batch_size: 1
+  grad_accum: 32
+  warmup: 0.1
+lr_schedule: cosine

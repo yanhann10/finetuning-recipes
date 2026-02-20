@@ -9,14 +9,11 @@ Usage:
 """
 
 import argparse
-import os
-import gc
 import io
 import json
-import time
+import os
+import sys
 import torch
-import librosa
-import whisper
 import yaml
 import wandb
 from datetime import datetime
@@ -34,19 +31,10 @@ from transformers import (
 )
 from trl import SFTConfig, SFTTrainer
 
-
-WHISPER_N_MELS = 128
-SAMPLE_RATE = 16000
-
-
-def bytes2mel(audio_np):
-    audio = whisper.pad_or_trim(audio_np)
-    mel = whisper.log_mel_spectrogram(audio, n_mels=WHISPER_N_MELS)
-    return mel.unsqueeze(0)
-
-
-def bytes_to_waveform(audio_bytes):
-    return librosa.load(io.BytesIO(audio_bytes), sr=SAMPLE_RATE)[0]
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from core import (bytes2mel, bytes_to_waveform, extract_audio_bytes,
+                  patch_processor, clear_memory,
+                  WHISPER_N_MELS, SAMPLE_RATE)
 
 
 def chunk_waveform(audio_np, chunk_sec):
@@ -70,56 +58,6 @@ def format_data(record):
         ]},
     ]}
 
-
-def extract_audio_bytes(msgs):
-    for msg in msgs:
-        for content in msg.get("content", []):
-            if isinstance(content, dict) and content.get("type") == "audio":
-                return content.get("audio")
-    return None
-
-
-TMPL_ORIG = (
-    "{% else %}{% for content in message['content'] %}"
-    "{% if content['type'] == 'image' or 'image' in content or 'image_url' in content %}"
-    "{% set image_count.value = image_count.value + 1 %}"
-    "{% if add_vision_id %}Picture {{ image_count.value }}: {% endif %}"
-    "<|vision_start|><|image_pad|><|vision_end|>"
-    "{% elif content['type'] == 'video' or 'video' in content %}"
-    "{% set video_count.value = video_count.value + 1 %}"
-    "{% if add_vision_id %}Video {{ video_count.value }}: {% endif %}"
-    "<|vision_start|><|video_pad|><|vision_end|>"
-    "{% elif 'text' in content %}{{ content['text'] }}"
-    "{% endif %}{% endfor %}<|im_end|>"
-)
-
-TMPL_REPL = (
-    "{% else %}{% for content in message['content'] %}"
-    "{% if content['type'] == 'audio' or 'audio' in content or 'audio_url' in content %}"
-    "<|audio_start|><|audio_pad|><|audio_end|>"
-    "{% elif content['type'] == 'image' or 'image' in content or 'image_url' in content %}"
-    "{% set image_count.value = image_count.value + 1 %}"
-    "{% if add_vision_id %}Picture {{ image_count.value }}: {% endif %}"
-    "<|vision_start|><|image_pad|><|vision_end|>"
-    "{% elif content['type'] == 'video' or 'video' in content %}"
-    "{% set video_count.value = video_count.value + 1 %}"
-    "{% if add_vision_id %}Video {{ video_count.value }}: {% endif %}"
-    "<|vision_start|><|video_pad|><|vision_end|>"
-    "{% elif 'text' in content %}{{ content['text'] }}"
-    "{% endif %}{% endfor %}<|im_end|>"
-)
-
-
-def patch_processor(proc):
-    special_tokens = ["<|audio_start|>", "<|audio_pad|>", "<|audio_end|>"]
-    proc.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
-    tmpl = proc.tokenizer.chat_template
-    if "audio" not in tmpl:
-        tmpl = tmpl.replace(TMPL_ORIG, TMPL_REPL, 1)
-        proc.tokenizer.chat_template = tmpl
-    proc.chat_template = proc.tokenizer.chat_template
-    assert "audio" in proc.chat_template, "Chat template patch failed!"
-    return proc
 
 def make_collate_fn(processor):
     def collate_fn(examples):
@@ -231,14 +169,6 @@ class WERCallback(TrainerCallback):
         if self.wait >= self.patience:
             print(f"Early stopping at step {step}: best WER={self.best_wer:.4f}")
             control.should_training_stop = True
-
-
-def clear_memory():
-    time.sleep(1)
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-    gc.collect()
 
 
 def run_sweep(cfg, hf_base, wandb_project, run_tag, processor,

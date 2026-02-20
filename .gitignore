@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+audio_vqa_cache/
+*.egg-info/
+.pytest_cache/
+wandb/

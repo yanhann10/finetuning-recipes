@@ -1,0 +1,62 @@
+========================================================================
+AUDIO VQA ERROR ANALYSIS - Stage 1 (hyan/qwen_audio_vqa_stage1)
+Model: Qwen2VL+Audio, projector-only training, 500 steps
+Dataset: hyan/audio-vqa-aokvqa (A-OKVQA + TTS questions)
+Eval: n=20 val samples | exact=0.25, soft=0.25, ROUGE-L=0.275
+========================================================================
+
+--- Error Case 1: Semantic Equivalent (number format) ---
+Input Audio:  "Which number birthday is probably being celebrated?"
+Input Image:  Birthday party scene with candles
+Ground Truth: thirty
+Predicted:    30
+ROUGE-L:      0.0
+Diagnosis:    Numerically correct but format mismatch. "30" and "thirty"
+              are the same answer. This is a metric limitation, not a
+              model error. The eval uses strict string matching.
+
+--- Error Case 2: Object Misidentification ---
+Input Audio:  "What is in the motorcyclist's mouth?"
+Input Image:  Low-resolution photo of motorcyclist on street
+Ground Truth: cigarette
+Predicted:    microphone
+ROUGE-L:      0.0
+Diagnosis:    Small object in a low-res crop. The model hallucinated
+              "microphone" - possibly influenced by audio-domain priors
+              (microphone is audio-related). The image is too small to
+              resolve fine details like a cigarette.
+
+--- Error Case 3: Attribute vs Object Confusion ---
+Input Audio:  "What best describes the pool of water?"
+Input Image:  Scene with a pool/puddle of water
+Ground Truth: dirty
+Predicted:    pond
+ROUGE-L:      0.0
+Diagnosis:    The question asks for a descriptor (adjective), but the
+              model responded with a noun. It answered "what is it"
+              instead of "how would you describe it." Indicates the model
+              isn't parsing question intent from audio well enough.
+
+--- Error Case 4: Semantic Equivalent (synonym) ---
+Input Audio:  "What type of pants is the man on the right wearing?"
+Input Image:  Scene with man wearing jeans
+Ground Truth: denim
+Predicted:    jeans
+ROUGE-L:      0.0
+Diagnosis:    "jeans" and "denim" are semantically equivalent. Same
+              pattern seen with "cell phone" vs "mobile phone" and
+              "usa" vs "american". The model gives correct answers that
+              don't match the expected string. ~25-30% of errors are
+              this type.
+
+--- Error Case 5: Visual Detail Beyond Audio Context ---
+Input Audio:  "What is the white substance on top of the cupcakes?"
+Input Image:  Cupcakes with white topping
+Ground Truth: icing
+Predicted:    powdered sugar
+ROUGE-L:      0.0
+Diagnosis:    Both "icing" and "powdered sugar" are plausible white
+              toppings on cupcakes. The model gave a reasonable but
+              non-matching answer. This requires fine visual
+              discrimination (smooth icing vs granular sugar) that may
+              be ambiguous even for humans.
